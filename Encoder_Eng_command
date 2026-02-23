@@ -1,0 +1,175 @@
+`timescale 1ns / 1ps
+
+/*
+ * ============================================================================
+ * Encoder Module Description
+ * ============================================================================
+ * [Working Principle]
+ * This module implements a 64-bit Polar Code encoder concatenated with a 16-bit CRC-CCITT.
+ * It uses a 3-stage pipeline design to ensure precise 2-cycle latency.
+ * 
+ * [Flowchart]
+ * [Cycle 0] start=1, input data_in (24-bit)
+ *    |
+ * [Cycle 1] Stage 1: Calculate CRC16 -> Map Data and CRC to the u vector at INFO_POS
+ *    |               (Unmapped bits are automatically 0, i.e., Frozen bits / ECC)
+ *    |
+ * [Cycle 2] Stage 2: Execute Polar Transform (u * G_64) to generate codeword
+ *    |
+ * [Cycle 3] Stage 3: Output codeword and assert done=1 (Precise 2-cycle delay)
+ * 
+ * [Data Flow: Data, CRC, ECC]
+ * 1. Data (24-bit): data_in -> participates in CRC calculation -> mapped to u[INFO_POS[0~23]]
+ * 2. CRC  (16-bit): calculated from data_in -> mapped to u[INFO_POS[24~39]]
+ * 3. ECC  (24-bit): i.e., Frozen bits, fixed at 0 -> implicit in the remaining positions of u
+ * 4. Codeword (64-bit): Result of u after Polar Transform, output to external
+ * ============================================================================
+ */
+
+
+/*
+ * ============================================================================
+ * Encoder Module (Revised Version)
+ * ============================================================================
+ * [Revision Notes]
+ * 1. Increased pipeline stages to meet tb_basic's strict timing requirement (Exactly 2 cycles after start).
+ * 2. Control Path: start -> r_valid_1 -> r_valid_2 -> done
+ * 3. Data Path:
+ *    - Cycle 1: Calculate CRC and map to u vector (r_u_vec)
+ *    - Cycle 2: Execute Polar Transform (r_codeword)
+ *    - Cycle 3: Output result (codeword) and assert done
+ * ============================================================================
+ */
+
+module polar64_crc16_encoder (
+    input  logic        clk,
+    input  logic        rst_n,
+    input  logic        start,
+    input  logic [23:0] data_in,
+    output logic        done,
+    output logic [63:0] codeword
+);
+
+    // ========================================================================
+    // Internal Parameters and Mapping Tables
+    // ========================================================================
+    localparam int data_pos [0:23] = '{
+        63, 62, 61, 59, 55, 47, 31, 
+        60, 58, 57, 54, 53, 51, 46, 45, 43, 39, 30, 29, 27, 23, 15, 
+        56, 52 
+    };
+
+    localparam int crc_pos [0:15] = '{
+        50, 49, 44, 42, 41, 38, 37, 35, 
+        28, 26, 25, 22, 21, 19, 14, 13
+    };
+
+    // ========================================================================
+    // Internal Function: CRC-16-CCITT Generator
+    // ========================================================================
+    function automatic logic [15:0] calc_crc16(input logic [23:0] din);
+        logic [15:0] crc;
+        logic feedback;
+        int i;
+        begin
+            crc = 16'h0000; 
+            for (i = 23; i >= 0; i = i - 1) begin
+                feedback = din[i] ^ crc[15];
+                crc = (crc << 1) & 16'hFFFF;
+                if (feedback) begin
+                    crc = crc ^ 16'h1021;
+                end
+            end
+            return crc;
+        end
+    endfunction
+
+    // ========================================================================
+    // Internal Function: Polar Transform
+    // ========================================================================
+    function automatic logic [63:0] polar_transform(input logic [63:0] u);
+        logic [63:0] v;
+        int step, half, i, j, s;
+        begin
+            v = u;
+            for (s = 0; s < 6; s = s + 1) begin
+                step = 1 << (s + 1);
+                half = 1 << s;
+                for (i = 0; i < 64; i = i + step) begin
+                    for (j = 0; j < half; j = j + 1) begin
+                        v[i + j] = v[i + j] ^ v[i + j + half];
+                    end
+                end
+            end
+            return v;
+        end
+    endfunction
+
+    // ========================================================================
+    // Hardware Pipeline Design (Revised for 2-Cycle Latency Logic)
+    // ========================================================================
+    
+    logic [63:0] r_u_vec;
+    logic [63:0] r_codeword;
+    logic        r_valid_1;
+    logic        r_valid_2;
+
+    // Pipeline Stage 1: Upon receiving start, calculate CRC and complete u vector mapping
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            r_u_vec    <= 64'b0;
+            r_valid_1  <= 1'b0;
+        end else begin
+            if (start) begin
+                logic [15:0] calc_crc;
+                logic [63:0] temp_u;
+                int k;
+                
+                calc_crc = calc_crc16(data_in);
+                temp_u = 64'b0; 
+                
+                // Mapping
+                for (k = 0; k < 24; k = k + 1) temp_u[data_pos[k]] = data_in[23-k];
+                for (k = 0; k < 16; k = k + 1) temp_u[crc_pos[k]]  = calc_crc[15-k];
+
+                r_u_vec    <= temp_u;
+                r_valid_1  <= 1'b1;
+            end else begin
+                r_valid_1  <= 1'b0;
+            end
+        end
+    end
+
+    // Pipeline Stage 2: Execute Polar Transform
+    // Added a register stage (r_valid_2) here to ensure done asserts at the correct time after start
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            r_codeword <= 64'b0;
+            r_valid_2  <= 1'b0;
+        end else begin
+            if (r_valid_1) begin
+                r_codeword <= polar_transform(r_u_vec);
+                r_valid_2  <= 1'b1;
+            end else begin
+                r_valid_2  <= 1'b0;
+            end
+        end
+    end
+
+    // Output Stage: Output Result
+    // When r_valid_2 is 1, it means 2 cycles of processing have passed, assert done at this time
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            codeword <= 64'b0;
+            done     <= 1'b0;
+        end else begin
+            if (r_valid_2) begin
+                codeword <= r_codeword;
+                done     <= 1'b1;
+            end else begin
+                done     <= 1'b0;
+            end
+        end
+    end
+
+endmodule
