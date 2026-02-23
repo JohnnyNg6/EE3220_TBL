@@ -1,0 +1,201 @@
+`timescale 1ns / 1ps
+
+/*
+ * ============================================================================
+ * Decoder Module (Revised Version - Bounded Distance Radius 3)
+ * ============================================================================
+ * [Revision Notes]
+ * 1. Adopts Behavioral Brute-force Search (BD-3) algorithm.
+ * 2. Utilizes the G = G^-1 property: flip 0~3 bits of rx, transform, and check Frozen bits.
+ * 3. Ensures data_pos and crc_pos are exactly consistent with the Encoder to resolve CRC Check failures.
+ * ============================================================================
+ */
+
+module polar64_crc16_decoder (
+    input  logic        clk,
+    input  logic        rst_n,
+    input  logic        start,
+    input  logic [63:0] rx,
+    output logic        done,
+    output logic [23:0] data_out,
+    output logic        valid
+);
+
+    // ========================================================================
+    // Internal Parameters and Mapping Tables
+    // ========================================================================
+    localparam int data_pos [0:23] = '{
+        63, 62, 61, 59, 55, 47, 31, 
+        60, 58, 57, 54, 53, 51, 46, 45, 43, 39, 30, 29, 27, 23, 15, 
+        56, 52 
+    };
+
+    localparam int crc_pos [0:15] = '{
+        50, 49, 44, 42, 41, 38, 37, 35, 
+        28, 26, 25, 22, 21, 19, 14, 13
+    };
+
+    // Pre-calculate the mask for Frozen Bits to accelerate the checking process
+    function automatic logic [63:0] get_frozen_mask();
+        logic [63:0] mask;
+        int i;
+        mask = 64'hFFFF_FFFF_FFFF_FFFF;
+        for (i = 0; i < 24; i = i + 1) mask[data_pos[i]] = 1'b0;
+        for (i = 0; i < 16; i = i + 1) mask[crc_pos[i]]  = 1'b0;
+        return mask;
+    endfunction
+
+    localparam logic [63:0] FROZEN_MASK = get_frozen_mask();
+
+    // ========================================================================
+    // Internal Function: CRC-16-CCITT Generator
+    // ========================================================================
+    function automatic logic [15:0] calc_crc16(input logic [23:0] din);
+        logic [15:0] crc;
+        logic feedback;
+        int i;
+        begin
+            crc = 16'h0000; 
+            for (i = 23; i >= 0; i = i - 1) begin
+                feedback = din[i] ^ crc[15];
+                crc = (crc << 1) & 16'hFFFF;
+                if (feedback) begin
+                    crc = crc ^ 16'h1021;
+                end
+            end
+            return crc;
+        end
+    endfunction
+
+    // ========================================================================
+    // Internal Function: Polar Transform (G_64)
+    // ========================================================================
+    function automatic logic [63:0] polar_transform(input logic [63:0] u);
+        logic [63:0] v;
+        int step, half, i, j, s;
+        begin
+            v = u;
+            for (s = 0; s < 6; s = s + 1) begin
+                step = 1 << (s + 1);
+                half = 1 << s;
+                for (i = 0; i < 64; i = i + step) begin
+                    for (j = 0; j < half; j = j + 1) begin
+                        v[i + j] = v[i + j] ^ v[i + j + half];
+                    end
+                end
+            end
+            return v;
+        end
+    endfunction
+
+    // ========================================================================
+    // Internal Function: Strict Bounded-Distance Decoding Radius 3 (Behavioral Search)
+    // ========================================================================
+    function automatic logic [64:0] decode_bd3(input logic [63:0] rx_val);
+        logic [63:0] e;
+        logic [63:0] u;
+        int i, j, k;
+        begin
+            // 0 flips (No error)
+            u = polar_transform(rx_val);
+            if ((u & FROZEN_MASK) == 64'b0) return {1'b1, u};
+
+            // 1 flip (1 bit error)
+            for (i = 0; i < 64; i = i + 1) begin
+                e = 64'h1 << i;
+                u = polar_transform(rx_val ^ e);
+                if ((u & FROZEN_MASK) == 64'b0) return {1'b1, u};
+            end
+
+            // 2 flips (2 bits error)
+            for (i = 0; i < 63; i = i + 1) begin
+                for (j = i + 1; j < 64; j = j + 1) begin
+                    e = (64'h1 << i) | (64'h1 << j);
+                    u = polar_transform(rx_val ^ e);
+                    if ((u & FROZEN_MASK) == 64'b0) return {1'b1, u};
+                end
+            end
+
+            // 3 flips (3 bits error)
+            for (i = 0; i < 62; i = i + 1) begin
+                for (j = i + 1; j < 63; j = j + 1) begin
+                    for (k = j + 1; k < 64; k = k + 1) begin
+                        e = (64'h1 << i) | (64'h1 << j) | (64'h1 << k);
+                        u = polar_transform(rx_val ^ e);
+                        if ((u & FROZEN_MASK) == 64'b0) return {1'b1, u};
+                    end
+                end
+            end
+
+            // Exceeds 3 bits error, return failure
+            return 65'b0; 
+        end
+    endfunction
+
+    // ========================================================================
+    // Decoder State Machine and Logic
+    // ========================================================================
+
+    logic [63:0] r_rx;
+    logic        r_active;
+    logic [3:0]  r_cycle;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            done     <= 1'b0;
+            valid    <= 1'b0;
+            data_out <= 24'b0;
+            r_active <= 1'b0;
+            r_cycle  <= 4'b0;
+        end else begin
+            done <= 1'b0; // Default to 0, ensuring done is a 1-cycle pulse
+            
+            if (start) begin
+                r_rx     <= rx;
+                r_active <= 1'b1;
+                r_cycle  <= 4'd1;
+            end else if (r_active) begin
+                r_cycle <= r_cycle + 4'd1;
+                
+                // Output result at the 3rd cycle (Matches timing diagram lat=3, and satisfies <= 12 condition)
+                if (r_cycle == 4'd2) begin
+                    logic [64:0] decode_res;
+                    logic [63:0] u_hat;
+                    logic [23:0] ext_data;
+                    logic [15:0] ext_crc;
+                    logic [15:0] comp_crc;
+                    int k;
+                    
+                    // 1. Execute Bounded-Distance Search with Radius 3
+                    decode_res = decode_bd3(r_rx);
+                    
+                    if (decode_res[64]) begin
+                        u_hat = decode_res[63:0];
+                        
+                        // 2. Extract Data and CRC
+                        for (k = 0; k < 24; k = k + 1) ext_data[23-k] = u_hat[data_pos[k]];
+                        for (k = 0; k < 16; k = k + 1) ext_crc[15-k]  = u_hat[crc_pos[k]];
+                        
+                        // 3. Recalculate CRC and Compare (Fail-safe rule)
+                        comp_crc = calc_crc16(ext_data);
+                        
+                        if (comp_crc == ext_crc) begin
+                            valid    <= 1'b1;
+                            data_out <= ext_data;
+                        end else begin
+                            valid    <= 1'b0; // CRC error, reject packet
+                            data_out <= 24'b0;
+                        end
+                    end else begin
+                        valid    <= 1'b0; // No valid codeword found within radius 3, reject packet
+                        data_out <= 24'b0;
+                    end
+                    
+                    done     <= 1'b1;
+                    r_active <= 1'b0;
+                end
+            end
+        end
+    end
+
+endmodule
