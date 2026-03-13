@@ -1,0 +1,51 @@
+#include <stdio.h> 
+
+#include "xil_io.h" 
+
+#include "xparameters.h" 
+
+#include "xbasic_types.h" 
+
+#include "xgpio.h" 
+
+#include "xstatus.h" 
+
+#include "sleep.h" 
+
+  
+
+XGpio leds; 
+
+  
+
+int main() 
+
+{ 
+
+    XGpio_Initialize(&leds, XPAR_LEDS_DEVICE_ID); 
+
+  
+
+    while(1) 
+
+    { 
+
+        // Binary counting from 1 to 7 (0001 to 0111) 
+
+        for(int i = 1; i <= 7; i++) 
+
+        { 
+
+            XGpio_DiscreteWrite(&leds, 1, i); 
+
+            usleep(250000); // 250ms delay 
+
+        } 
+
+    } 
+
+     
+
+    return 0; 
+
+} 
