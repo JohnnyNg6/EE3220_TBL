@@ -1,0 +1,93 @@
+#include <stdio.h> 
+
+#include "xil_io.h" 
+
+#include "xparameters.h" 
+
+#include "xbasic_types.h" 
+
+#include "xgpio.h" 
+
+#include "xstatus.h" 
+
+  
+
+XGpio leds; 
+
+XGpio buttons; 
+
+  
+
+int main() 
+
+{ 
+
+    u32 btn_data; 
+
+    u32 prev_btn_data = 0; 
+
+    int count = 0; 
+
+  
+
+    XGpio_Initialize(&leds, XPAR_LEDS_DEVICE_ID); 
+
+    XGpio_Initialize(&buttons, XPAR_BUTTONS_DEVICE_ID); 
+
+     
+
+    // Initial state 
+
+    XGpio_DiscreteWrite(&leds, 1, count); 
+
+  
+
+    while(1) 
+
+    { 
+
+        btn_data = XGpio_DiscreteRead(&buttons, 1); 
+
+  
+
+        // Check if any button is pressed (rising edge detection) 
+
+        if (btn_data != 0 && prev_btn_data == 0) 
+
+        { 
+
+            count++; 
+
+             
+
+            // Reset the count to zero when it reaches 8 
+
+            if (count == 8) { 
+
+                count = 0; 
+
+            } 
+
+             
+
+            XGpio_DiscreteWrite(&leds, 1, count); 
+
+             
+
+            // Button debounce delay 
+
+            for(volatile int i = 0; i <= 0x000FFFFF; i++) {} 
+
+        } 
+
+         
+
+        prev_btn_data = btn_data; 
+
+    } 
+
+     
+
+    return 0; 
+
+} 
